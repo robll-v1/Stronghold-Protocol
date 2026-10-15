@@ -561,14 +561,20 @@ describe('websocket lobby', () => {
     const c = await pool.player('Spammer');
     const N = 100;
     const rids = [];
+    const t0 = Date.now();
     for (let i = 0; i < N; i++) rids.push(c.send({ t: 'ping', c: i }));
     const replies = [];
     for (const rid of rids) replies.push(await c.waitFor(null, (m) => m.rid === rid, 3000));
+    const elapsedMs = Date.now() - t0;
     const pongs = replies.filter((m) => m.t === 'pong').length;
     const limited = replies.filter((m) => m.t === 'error' && m.code === ERR.RATE).length;
     assert.equal(pongs + limited, N);
-    assert.ok(pongs >= 39 && pongs <= 45, `pongs ${pongs}`); // hello used one token
-    assert.ok(limited >= 55, `limited ${limited}`);
+    // The bucket refills while the burst streams in (40 tokens/s): on a slow runner the whole exchange
+    // takes hundreds of ms, so the granted count grows with the time it took instead of a fixed 39…45.
+    // hello used one token, hence the base of 39.
+    const grantedMax = Math.min(N, 39 + Math.ceil((elapsedMs / 1000) * 40) + 5);
+    assert.ok(pongs >= 39 && pongs <= grantedMax, `pongs ${pongs} (elapsed ${elapsedMs} ms)`);
+    assert.ok(limited >= N - grantedMax, `limited ${limited}`);
     assert.ok(c.isOpen);
     await delay(1100);
     const ok = await c.request({ t: 'ping', c: 0 });
@@ -576,18 +582,27 @@ describe('websocket lobby', () => {
   });
 
   test('flooding far beyond the limit closes the socket (1008)', async () => {
-    const c = await pool.player('Flood');
-    // bursts until the server closes it: the close needs more than abuseDropsPerSec drops inside one 1 s window, and on
-    // a heavily loaded machine a single burst of 600 can be read over more than a second — the old single burst then
-    // never closed the socket and `await c.closed` (no timeout) hung the whole file
-    const t0 = Date.now();
-    while (c.isOpen && Date.now() - t0 < 20000) {
-      for (let i = 0; i < 600 && c.isOpen; i++) c.send({ t: 'ping', c: i, rid: null });
-      await delay(50);
+    // The default abuse threshold (400 drops/s) presumes the server ingests frames far faster than the rate
+    // limit grants them; on a slow runner (Windows CI) it reads at most a few hundred frames a second, so even
+    // constant bursts never accumulate 400 drops inside one 1 s window and the socket never closes. Boot a
+    // dedicated server with a threshold a slow runner can actually reach — the close path itself (drop
+    // counting, the 1 s window, the 1008 code) is unchanged.
+    const flood = await startServer({ port: 0, host: '127.0.0.1', quiet: true, abuseDropsPerSec: 20 });
+    try {
+      const c = await TestClient.connect(`ws://127.0.0.1:${flood.port}/ws`);
+      await c.hello('Flood');
+      // bursts until the server closes it (bounded, so a failure asserts instead of hanging the file)
+      const t0 = Date.now();
+      while (c.isOpen && Date.now() - t0 < 15000) {
+        for (let i = 0; i < 600 && c.isOpen; i++) c.send({ t: 'ping', c: i, rid: null });
+        await delay(50);
+      }
+      const info = await Promise.race([c.closed, delay(5000).then(() => null)]);
+      assert.ok(info, 'the server closed the flooding socket');
+      assert.equal(info.code, 1008);
+    } finally {
+      await flood.close();
     }
-    const info = await Promise.race([c.closed, delay(10000).then(() => null)]);
-    assert.ok(info, 'the server closed the flooding socket');
-    assert.equal(info.code, 1008);
   });
 
   test('create / join / leave', async () => {
